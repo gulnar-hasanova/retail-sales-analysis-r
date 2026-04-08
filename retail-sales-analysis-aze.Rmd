@@ -1,0 +1,317 @@
+---
+title: "Final Project"
+author: "Gulnar Hasanova"
+date: "2026-02-13"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+## Setup
+
+> Tələb ediləcək paketləri aktivləşdirin
+
+```{r setup,include=TRUE,echo=TRUE,warning=FALSE,message=FALSE,error=FALSE}
+library(dplyr)
+library(readr)
+library(data.table)
+library(xlsx)
+library(readxl)
+library(ggplot2)
+library(plotly)
+library(kableExtra)
+library(DT)
+library(lubridate)
+library(stringr)
+library(janitor)
+library(RMariaDB)
+library(mailR)
+library(rmarkdown)
+library(knitr)
+library(DT)
+library(tidyr)
+library(scales)
+library(tidyverse)
+
+data = readRDS("qara.rds")
+
+```
+
+## Mündəricat
+
+> Cari Hesabat aşağıdakı hissələrdən ibarətdir:
+
+- Deskriptiv Təhlil
+- Anomaliyalar
+- Proqnoz və Fərziyyələr
+- Xülasə
+
+## 1. Deskriptiv Təhlil
+
+> 1. Məlumat Bazalarının Birləşdirilməsi (Data Merging)
+
+Analizimizin əsasını iki fərqli strukturda olan böyük həcmli məlumat bazasının inteqrasiyası təşkil edir. Bu inteqrasiya bizə hər bir satışın (çekin) nə qədər gəlirlilik (marja) gətirdiyini görməyə imkan verir.
+
+> 1.1. Mənbə Cədvəllər
+
+`fp_receipts` (Satışlar): 10 milyondan çox sətirdən ibarət olan bu cədvəl bizim "Raw Data"-mızdır. Hər bir sətir real bir satışı təmsil edir.
+
+`fp_map` (Marja Xəritəsi): 118 mindən çox sətirlik bu cədvəl isə hər bir məhsulun müəyyən zaman kəsiyindəki mənfəət marjasını göstərir.
+
+> 1.2. Join Strategiyası
+
+İki böyük cədvəlin birləşdirilməsi zamanı qarşıya çıxan əsas texniki məqam, məhsul kodlarının olmaması səbəbindən `product_name` sütununa əsaslanmaq zərurəti idi. Lakin biznes nöqteyi-nəzərindən qiymət və marja dinamik olduğu üçün, join prosesi aşağıdakı mürəkkəb qayda ilə icra edilmişdir:
+
+- *Məhsul Uyğunluğu:* `fp_receipts` və `fp_map` cədvəlləri `product_name` üzrə uygunlasdirilmisdir.
+
+- *Zaman Faktoru:* Hər bir satışın `rec_date` aid olduğu tarix aralığı, `fp_map` cədvəlindəki müvafiq marja dövrü ilə üst-üstə salınmışdır.
+
+> 1.3. Datanın Dəyişənləri və Analitik Əhəmiyyəti
+
+- `pos` (Point of Sale): Satışın baş verdiyi konkret filial və ya mağaza adı.
+
+- `rec_date` (Receipt Date): Satışın baş verdiyi tarix.
+
+- `rec_id` (Receipt ID): Hər bir alış-verişin unikal nömrəsi (çek nömrəsi).
+
+- `product_name & product` : Satılan məhsulun tam adı və kateqoriya qısaltması.
+
+- `qnt` (Quantity): Satılan məhsulun miqdarı.
+
+- `unit_price` (Unit Price): Məhsulun bir ədədinin qiyməti.
+
+- `period` : Satışın aid olduğu zaman kəsiyi (məsələn, 202404 - Aprel 2024).
+
+- `product_type` : Məhsulun növü (Food / Non-Food).
+
+- `profit_margin` : Məhsuldan əldə olunan mənfəət marjası.
+
+
+> 1.2.1. Verilənlərin Statistik Xülasəsi (Statistical Summary)
+
+```{r summary,include=TRUE,echo=TRUE,warning=FALSE,message=FALSE,error=FALSE}
+summary(data)
+```
+
+**Nəticələrin Şərhi:**
+
+Yuxarıdakı statistik xülasə birləşdirilmiş datanın (10 mln+ sətir) ümumi vəziyyətini əks etdirir. Burada bir neçə kritik məqam diqqəti cəlb edir:
+
+- *Mərkəzi Meyl:* `unit_price` və `Total` sütunları üzrə *Mean* (orta hesab) və *Median* arasındakı fərq, datada sağa meyilliliyin (positive skewness) olduğunu və bəzi yüksək məbləğli satışların (outliers) mövcudluğunu göstərir.
+
+- *Həcm:* `qnt` (miqdar) sütununda 1-ci kvartil (1st Qu.) ilə 3-cü kvartil arasındakı diapazon pərakəndə satışın (retail) stabilliyini, maksimum dəyər isə topdan və ya anomaliya xarakterli satışları işarə edir.
+
+- *Məlumat Tamlığı:* `profit_margin` sütununda müşahidə olunan boşluqlar (NA) `fp_map` cədvəlində bəzi məhsulların müvafiq tarix aralığında marja məlumatının olmamasından qaynaqlanır. Bu kənarlaşmalar analizimizin növbəti mərhələsində ("Anomaliyalar") ətraflı araşdırılacaqdır.
+
+
+
+## 2. Anomaliyalar
+
+> 2.1. Maliyyə və Satış Anomaliyalarının İdentifikasiyası
+
+```{r a1,include=TRUE,echo=TRUE,warning=FALSE,message=FALSE,error=FALSE}
+# Ən yüksək satışların siyahısı
+critical_anomalies <- data %>%
+  select(rec_id, pos, rec_date, product_name, qnt, unit_price, Total) %>%
+  arrange(desc(Total)) %>%
+  head(10)
+
+knitr::kable(critical_anomalies, caption = "Top 10 Kritik Satış Anomaliyası")
+
+
+# Məntiqi xətaların yoxlanılması
+logical_errors <- data %>%
+  filter(profit_margin < 0 | unit_price <= 0 | qnt <= 0)
+
+cat("Aşkar edilmiş məntiqi xətaların sayı:", nrow(logical_errors))
+
+# 100%-dən böyük marjaların analizi
+extreme_margins <- data %>%
+  filter(profit_margin > 1) %>%
+  select(rec_id, pos, product_name, unit_price, profit_margin) %>%
+  arrange(desc(profit_margin)) %>% 
+  head(10)
+
+knitr::kable(head(extreme_margins, 10), caption = "Marjası 100%-dən Böyük Olan Məhsullar")
+
+
+# 100%-dən kicik marjaların analizi
+low_margins <- data %>%
+  filter(profit_margin < 0) %>%
+  select(rec_id, pos, product_name, unit_price, profit_margin) %>%
+  arrange(desc(profit_margin)) %>% 
+  head(10)
+
+knitr::kable(head(low_margins, 10), caption = "Marjası 100%-dən Kicik Olan Məhsullar")
+
+
+
+# Normal vs anomaliya olanları işarələyirik
+data_viz <- data %>%
+  sample_n(20000) %>% # 10 mln sətir üçün sample mütləqdir
+  mutate(is_anomaly = ifelse(profit_margin > 1 | profit_margin < 0, "Anomaliya", "Normal"))
+
+
+ggplot(data_viz, aes(x = unit_price, y = profit_margin, color = is_anomaly)) +
+  geom_point(alpha = 0.5) +
+  scale_color_manual(values = c("Anomaliya" = "red", "Normal" = "steelblue")) +
+  theme_minimal() +
+  labs(title = "Marja və Qiymət Anomaliyalarının Xəritəsi",
+       x = "Qiymət (AZN)", y = "Marja (%)")
+```
+
+> 2.2. Zaman Oxu Üzrə Satış Dinamikası və Kənarlaşmaların Analizi
+
+```{r a2,include=TRUE,echo=TRUE,warning=FALSE,message=FALSE,error=FALSE}
+
+# 1. Tarixi Date formatına sal və ay çıxar
+df_ts = data %>%
+  mutate(
+    rec_date = as.Date(rec_date),
+    ay = factor(format(rec_date, "%m"), 
+                levels = c("04", "05"), 
+                labels = c("Aprel", "May"))
+  )
+
+# 2. Günlük gəlirin hesablanması
+daily_revenue = df_ts %>%
+  group_by(rec_date, ay) %>%
+  summarise(
+    gelir = sum(Total, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# 3. Line chart (facet by month + border)
+ggplot(daily_revenue, aes(x = rec_date, y = gelir)) +
+  geom_line(color = "steelblue", linewidth = 1.2) +
+  facet_wrap(~ ay, scales = "free_x") +
+  scale_y_continuous(labels = scales::scientific) +
+  labs(
+    x = "Tarix",
+    y = "Gəlir",
+    title = "Günlük Gəlir Trendi (Aylıq)"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    strip.text = element_text(face = "bold", size = 14),
+    panel.border = element_rect(color = "grey70", fill = NA, linewidth = 0.8),
+    panel.spacing = unit(1.5, "lines"), # İki ay arasındakı boşluğu artırır
+    strip.background = element_rect(fill = "grey95", color = "grey70"), # Başlığa fon verir
+    axis.text.x = element_text(angle = 0, hjust = 0.5)
+  )
+```
+
+
+**Şərh:**
+
+Bu qrafikdə gördüyümüz kəskin sıçrayışlar (piklər), datadakı "Kritik Anomaliyaları" təmsil edir. Normal günlərdə satışlar müəyyən bir xətt üzrə davam etdiyi halda, bəzi günlərdə gəlirin qəfildən 5-10 qat artması təbii pərakəndə satış gedişatına uyğun deyil.
+
+Bu pik nöqtələrinin olduğu günlərdə ya çox böyük bir korporativ satış edilib, ya da sistemdə təkrarlanan (duplicate) məlumatlar yaranıb.
+
+> 2.3. Məhsul Növləri və Anomaliyalar Arasındakı Əlaqə
+
+```{r a3,include=TRUE,echo=TRUE,warning=FALSE,message=FALSE,error=FALSE}
+# Boxplot ilə vizuallaşdırma
+library(ggplot2)
+
+ggplot(data, aes(x = product_type, y = Total, fill = product_type)) +
+  geom_boxplot(outlier.colour = "red", outlier.shape = 16, outlier.size = 3) +
+  theme_minimal() +
+  scale_y_continuous(labels = scales::comma) +
+  labs(title = "Məhsul Növləri Üzrə Satış Anomaliyaları",
+       subtitle = "Qırmızı nöqtələr statistik kənaraçıxmaları (outliers) təmsil edir",
+       x = "Məhsul Növü", y = "Satış Məbləği (AZN)")
+```
+
+**Şərh:**
+
+Kateqoriya Uyğunsuzluğu (NA Problemi): Qrafikdə ən böyük anomaliyalar (300,000 AZN-ə çatan nöqtələr) məhz "NA" qrupunda cəmləşib. Bu, datanın birləşdirilməsi (join) prosesində `product_name` ilə `product` sütunlarının tam üst-üstə düşməməsindən qaynaqlanır. Texniki olaraq, marja xəritəsində (`fp_map`) qarşılığı olmayan məhsullar kateqoriyasız qaldığı üçün sistem onları "NA" olaraq qruplaşdırıb.
+
+Maraqlı məqam odur ki, real pərakəndə satış kateqoriyaları olan "FOOD" (Qida) və "NON-FOOD" (Qeyri-qida) bölmələrində satışlar normal diapazondadır. Bu sübut edir ki, datadakı rəqəmlər əslində real pərakəndə alış-veriş deyil, kateqoriyası təyin olunmamış texniki xətalardır.
+
+
+
+## 3. Proqnoz və Fərziyyələr
+
+> 3.1. Satışların Xətti Reqressiya Modeli (Proqnoz)
+
+```{r p1,include=TRUE,echo=TRUE,warning=FALSE,message=FALSE,error=FALSE}
+# Reqressiya modeli: Satış məbləğini proqnozlaşdıran amillər
+model = lm(Total ~ unit_price + product_type + hefte_gunu, data = data)
+
+# Modelin xülasəsi
+summary(model)
+```
+
+**Şərh:**
+
+- *Modelin Əsas Faktoru (Məhsul Kateqoriyası):* Boxplot qrafiki və modelin `na.action` hissəsindən (9,372,219 sətir kənarlaşdırılıb) göründüyü kimi, məhsul adlarının uyğunsuzluğu səbəbindən yaranan "NA" dəyərləri proqnozun dəqiqliyinə ən çox mane olan amildir. Lakin təmizlənmiş 440,390 sətir üzərində aparılan analiz göstərir ki, məhsulun tipi `(product_type`) satış məbləğinin formalaşmasında əsas hərəkətverici qüvvədir.
+
+- *Qiymət və Həcm Münasibəti:* Modelin əmsalları (`coefficients`) göstərir ki, vahid qiymətin (`unit_price`) dəyişməsi ümumi satış məbləğinə birbaşa təsir edir. Statistik xülasədə `unit_price` üçün maksimum dəyərin 132,300 AZN olması kimi ekstremal hallar model tərəfindən "outlier" (kənaraçıxma) kimi qəbul edilsə də, modelin ümumi meyli qiymət artımının dövriyyəyə müsbət, lakin satış miqdarına (qnt) mənfi təsir edə biləcəyini işarə edir.
+
+- *Zaman Faktoru (Həftənin Günləri):* Modelin tərkibindəki hefte_gunu dəyişəni sübut edir ki, pərakəndə satış dövriyyəsi həftənin günlərindən asılı olaraq statistik əhəmiyyətli dərəcədə dəyişir. Məsələn, Cümə günü (Friday) müşahidə olunan 3,363,218 tranzaksiya həcmi modeldə yüksək əmsalla ifadə olunur ki, bu da həmin günün proqnozlaşdırılan gəlir potensialının digər günlərdən daha yüksək olduğunu təsdiqləyir.
+
+Bu model bizə imkan verir ki, məhsul növünü və satış gününü daxil etməklə təxmini gəlir proqnozu hazırlayaq. Lakin NA dəyərlərinin çoxluğu (93%+) göstərir ki, proqnozun daha dəqiq olması üçün ilk növbədə məhsul kataloqunun (`product_name` eşləşdirilməsi) rəqəmsal təmizlənməsi icra olunmalıdır.
+
+> 3.2. Qiymət Elastikliyi və Korrelyasiya Analizi
+
+```{r p2,include=TRUE,echo=TRUE,warning=FALSE,message=FALSE,error=FALSE}
+
+correlation_test <- cor.test(data$unit_price, data$qnt)
+
+# Vizuallaşdırma
+ggplot(data %>% sample_n(10000), aes(x = unit_price, y = qnt)) +
+  geom_point(alpha = 0.2, color = "darkblue") +
+  geom_smooth(method = "lm", color = "red") +
+  scale_x_log10() +
+  labs(title = "Qiymət və Satış Miqdarı Arasındakı Əlaqə",
+       subtitle = paste("Korrelyasiya əmsalı:", round(correlation_test$estimate, 3)),
+       x = "Vahid Qiymət (AZN)", y = "Satış Miqdarı") +
+  theme_minimal()
+```
+
+**Şərh:**
+
+Analiz göstərir ki, qiymət və satış miqdarı arasında mənfi korrelyasiya mövcuddur. Korrelyasiya əmsalının mənfi olması pərakəndə satışın klassik qaydasını təsdiqləyir: Qiymət artdıqca, müştərinin həmin məhsulu alma tezliyi və ya miqdarı azalır. Bu, bizə qiymət optimallaşdırılması zamanı hansı həddə qədər artım edə biləcəyimiz barədə siqnal verir.
+
+
+> 3.3. Statistik Fərziyyə (T-Test): Cümə günü piki təsadüfidirmi?
+
+```{r p3,include=TRUE,echo=TRUE,warning=FALSE,message=FALSE,error=FALSE}
+# T-Test: Cümə günü vs Digər günlər
+friday_sales = data$Total[data$hefte_gunu == "Friday"]
+other_sales = data$Total[data$hefte_gunu != "Friday"]
+
+t_test_res = t.test(friday_sales, other_sales)
+```
+
+**Şərh:**
+
+P-value dəyəri 0.05-dən kiçik olduğu üçün biz sıfır fərziyyəsini rədd edirik. Bu o deməkdir ki, Cümə günü satışlarının artması təsadüfi deyil, statistik olaraq əhəmiyyətli bir trenddir. Biznes bu məlumatdan istifadə edərək Cümə günləri üçün xüsusi marketinq kampaniyaları planlaşdıra bilər.
+
+
+
+## 4. Xülasə
+
+> 4.1. Yekun Nəticə və Strateji Biznes Tövsiyələri
+
+10 milyona yaxın satış sətirinin analiz edilməsi nəticəsində əldə olunan tapıntılar həm data keyfiyyəti, həm də satış strategiyası baxımından aşağıdakı nəticələri doğurur:
+
+- **Data Keyfiyyəti və İnteqrasiya:** Analiz zamanı məlum oldu ki, datanın 93%-dən çoxunda məhsul adlarının eşləşməməsi (NA dəyərləri) proqnozlaşdırma imkanlarını məhdudlaşdırır. Biznes üçün ilk tövsiyə, *ERP və kassa sistemlərindəki məhsul kataloqlarının rəqəmsal təmizlənməsidir*. Bu, gələcəkdə hər bir məhsulun marjasını anlıq izləməyə imkan verəcək.
+
+- **Anomaliyaların İdarə Edilməsi:** Tapılan kəskin anomaliyalar (məsələn, 132 min AZN-lik təkli satışlar) göstərir ki, kassa əməliyyatlarında müəyyən limitlər və ya ciddi nəzarət mexanizmləri yoxdur. *Tövsiyə olunur ki,* pərakəndə satış nöqtələrində qeyri-adi dərəcədə yüksək məbləğli və ya miqdarlı satışlar üçün avtomatlaşdırılmış "xəbərdarlıq" (alert) sistemi qurulsun.
+
+- **Satış Dinamikası:** Reqressiya modelimiz sübut etdi ki, həftənin günləri (xüsusilə Cümə günü) satış həcminə statistik olaraq ciddi təsir edir. *Biznes tövsiyəsi olaraq,* bu günlərdə loqistika və kassa heyətinin optimallaşdırılması, həmçinin yüksək tələbat olan "Food" kateqoriyalı məhsulların stok ehtiyatlarının artırılması məqsədəuyğundur.
+
+- **Qiymət Strategiyası:** Korrelyasiya analizində gördüyümüz "qiymət artdıqca miqdarın azalması" tendensiyası göstərir ki, müştərilər qiymət dəyişikliklərinə həssasdır. Bu səbəbdən, qiymət artımları zamanı məhsulun marja payı ilə satış tezliyi arasındakı balans qorunmalıdır.
+
+
+
+
+
+
+
+
+
+
